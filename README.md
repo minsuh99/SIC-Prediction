@@ -1,2 +1,2 @@
 # SIC-Prediction
-Park2Hana &amp; Kim
+Park21 &amp; Kim
