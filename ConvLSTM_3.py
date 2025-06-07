@@ -33,18 +33,23 @@ climate_data = climate_file['data']
 # Target Data
 sic_file = np.load("./preprocessed/NSIDC_seaice_con_199501_202412.npz")
 sic_data = sic_file['sic']
+x_coords = sic_file['x']
+y_coords = sic_file['y']
+dates = sic_file['dates']  # List of dates corresponding to the SIC data
+mask = sic_file['mask']  # (360, 428, 300)
 
 ## Custom Sea Ice Dataset
 class SeaIceDataset(Dataset):
-    def __init__(self, climate_array, sic_array, window_length, prediction_length, start_idx, end_idx):
+    def __init__(self, climate_array, sic_array, mask_array, window_length, prediction_length, start_idx, end_idx):
         self.climate = climate_array
         self.sic = sic_array
+        self.mask = mask_array
         self.L = window_length                 # Sliding window size
-        self.H = prediction_length         # e.g. 3 or 6
+        self.pred_L = prediction_length         # e.g. 3 or 6
 
-        # only go up to `len - H`
+        # only go up to `len - prediction_length`
         self.start = start_idx + self.L
-        self.end = end_idx - (self.H - 1)
+        self.end = end_idx - (self.pred_L - 1)
 
     def __len__(self):
         return self.end - self.start + 1
@@ -55,19 +60,19 @@ class SeaIceDataset(Dataset):
         # Feature Sequence
         seq_climate = self.climate[t-self.L : t]   # (L, 10, 428, 300)
         # Target
-        target_sic = self.sic[t : t + self.H] # (428, 300)
-        # add channel dim
-        target_sic = np.expand_dims(target_sic, axis=0) # (1, 428, 300)
-        # swap to (1,H,H,W) → (H,1,H,W) if you prefer batch_first later
-
+        target_sic = self.sic[t : t + self.pred_L] # (pred_L, 428, 300)
+        # Mask
+        mask = self.mask[t : t + self.pred_L]         # (pred_L, 428, 300)
+        
         seq_climate = torch.from_numpy(seq_climate).float()
         target_sic = torch.from_numpy(target_sic).float()
+        mask = torch.from_numpy(mask).float()
 
-        return seq_climate, target_sic
+        return seq_climate, target_sic, mask
 
-train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, window_length=12, prediction_length=3, start_idx=0, end_idx=287)
-val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, window_length=12, prediction_length=3, start_idx=288, end_idx=323)
-test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, window_length=12, prediction_length=3, start_idx=324, end_idx=359)
+train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=0, end_idx=287)
+val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=288, end_idx=323)
+test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=324, end_idx=359)
 
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0, pin_memory=True)
@@ -198,7 +203,7 @@ class ConvLSTM(nn.Module):
         return layer_output_list, last_state_list
 
 class SeaIceConvLSTM(nn.Module):
-    def __init__(self, input_channels=10, hidden_channels=64, kernel_size=(3, 3), lstm_layers=1, height=428, width=300, bias=True):
+    def __init__(self, input_channels=10, hidden_channels=64, kernel_size=(3, 3), lstm_layers=1, pred_L=1, height=428, width=300, bias=True):
         super(SeaIceConvLSTM, self).__init__()
 
         # 1) ConvLSTM 모듈
@@ -224,7 +229,7 @@ class SeaIceConvLSTM(nn.Module):
         self.relu  = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(
             in_channels=32,
-            out_channels=1,
+            out_channels=pred_L,
             kernel_size=3,
             padding=1,
             bias=bias
@@ -244,26 +249,18 @@ class SeaIceConvLSTM(nn.Module):
         # 2) 후처리: conv → ReLU → conv
         x = self.conv1(h_n)    # (B, 32, H, W)
         x = self.relu(x)
-        out = self.conv2(x)   # (B, 1, H, W)
+        out = self.conv2(x)   # (B, pred_L, H, W)
 
         return out
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_epochs = 50
-model = SeaIceConvLSTM(
-    input_channels=10,
-    hidden_channels=64,
-    kernel_size=(3,3),
-    lstm_layers=1,
-    height=428,
-    width=300,
-    bias=True
-).to(device)
+model = SeaIceConvLSTM(input_channels=10, hidden_channels=64, kernel_size=(3,3), lstm_layers=1, pred_L=3, height=428, width=300, bias=True).to(device)
 
 # Loss & Optimizer & Learning rate Scheduler
 criterion = nn.MSELoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
 
 best_val_loss = float('inf')
 
@@ -272,13 +269,15 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress"):
     # Train
     model.train()
     total_train_loss = 0.0
-    for seq_climate, target_sic in tqdm(train_loader, desc="training"):
-        seq_climate = seq_climate.to(device) # (B, L, 11, 428, 300)
-        target_sic  = target_sic.to(device) # (B, 1, 428, 300)
-        
+    for seq_climate, target_sic, mask in tqdm(train_loader, desc="training"):
+        seq_climate = seq_climate.to(device) # (B, L, 10, 428, 300)
+        target_sic  = target_sic.to(device) # (B, pred_L, 428, 300)
+        mask = mask.to(device) # (B, pred_L, 428, 300)
+
         optimizer.zero_grad()
-        pred_sic = model(seq_climate)            # (B, 1, 428, 300)
-        loss = criterion(pred_sic, target_sic)
+        pred_sic = model(seq_climate)            # (B, pred_L, 428, 300)
+        loss_map = criterion(pred_sic, target_sic)
+        loss = (loss_map * mask).sum() / mask.sum()
         loss.backward()
         optimizer.step()
         total_train_loss += loss.item() * seq_climate.size(0)
@@ -289,12 +288,14 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress"):
     model.eval()
     total_val_loss = 0.0
     with torch.no_grad():
-        for seq_climate, target_sic in tqdm(val_loader, desc="validation"):
+        for seq_climate, target_sic, mask in tqdm(val_loader, desc="validation"):
             seq_climate = seq_climate.to(device)
             target_sic = target_sic.to(device)
+            mask = mask.to(device) # (B, pred_L, 428, 300)
 
             pred_sic = model(seq_climate)
-            loss = criterion(pred_sic, target_sic)
+            loss_map = criterion(pred_sic, target_sic)
+            loss = (loss_map * mask).sum() / mask.sum()
             total_val_loss += loss.item() * seq_climate.size(0)
 
     avg_val_loss = total_val_loss / len(val_loader.dataset)
@@ -321,12 +322,13 @@ test_trues = []
 test_losses = 0.0
 
 with torch.no_grad():
-    for seq_climate, target_sic in test_loader:
+    for seq_climate, target_sic, mask in test_loader:
         seq_climate = seq_climate.to(device)
         target_sic = target_sic.to(device)
 
         pred_sic = model(seq_climate)
-        loss = criterion(pred_sic, target_sic)
+        loss_map = criterion(pred_sic, target_sic)
+        loss = (loss_map * mask).sum() / mask.sum()
         test_losses += loss.item() * seq_climate.size(0)
 
         test_preds.append(pred_sic.cpu().numpy())
@@ -335,26 +337,32 @@ with torch.no_grad():
 avg_test_loss = test_losses / len(test_loader.dataset)
 print(f"Average Test Loss = {avg_test_loss:.6f}")
 
-def plot_sic_comparison(pred, true, idx, save_path=None):
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-
-    im0 = axes[0].imshow(true[0], vmin=0, vmax=1, cmap='Blues')
-    axes[0].set_title(f"Ground Truth (Idx {idx})")
-    axes[0].axis('off')
-    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-
-    im1 = axes[1].imshow(pred[0], vmin=0, vmax=1, cmap='Blues')
-    axes[1].set_title(f"Prediction (Idx {idx})")
-    axes[1].axis('off')
-    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-
+# Visualization
+def plot_sic_error_map(pred, true, x_coords, y_coords, dates, sample_idx=0, horizon_step=0, start_idx=None):
+    true_map = true[sample_idx][horizon_step]
+    pred_map = pred[sample_idx][horizon_step]
+    diff_map = true_map - pred_map
+    
+    date_str = dates[start_idx + sample_idx + horizon_step]
+    X, Y = np.meshgrid(x_coords, y_coords)
+    m = abs(diff_map).max()
+    vmin, vmax = -m, m
+    
+    plt.figure(figsize=(8, 10))
+    im = plt.pcolormesh(X, Y, diff_map, cmap='bwr', vmin=vmin, vmax=vmax, shading='auto')
+    plt.colorbar(im, label='True − Predicted')
+    plt.title(f'SIC Error (True−Pred) – {date_str}, Horizon {horizon_step+1}')
+    plt.xlabel('X (km)')
+    plt.ylabel('Y (km)')
     plt.tight_layout()
-    if save_path is not None:
-        plt.savefig(save_path, dpi=150)
-    else:
-        plt.show()
-    plt.close()
+    
+    plt.show()
+    
+# Print Visualization
+L = test_dataset.L
+test_start_idx = test_dataset.start
+test_pred_vis = np.concatenate(test_preds, axis=0)
+test_true_vis = np.concatenate(test_trues, axis=0)
 
-# 예시: 테스트 10번째 샘플을 시각화
-sample_idx = 0
-plot_sic_comparison(pred=test_preds[sample_idx], true=test_trues[sample_idx], idx=sample_idx)
+# Visualize the horizon_step (0, first month) in Pred_L(3 months)
+plot_sic_error_map(pred=test_pred_vis, true=test_true_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, sample_idx=0, horizon_step=0, start_idx=test_start_idx)
