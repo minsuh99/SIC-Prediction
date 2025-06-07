@@ -1,10 +1,3 @@
-## Load Module & Fix Seed
-import torch
-print("PyTorch version:", torch.__version__)
-print("CUDA available:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("GPU device:", torch.cuda.get_device_name(0))
-
 import os
 import random
 import glob
@@ -266,7 +259,7 @@ model = SeaIceConvLSTM(
 
 # Loss & Optimizer & Learning rate Scheduler
 criterion = nn.MSELoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
 best_val_loss = float('inf')
@@ -360,5 +353,5 @@ def plot_sic_comparison(pred, true, idx, save_path=None):
     plt.close()
 
 # 예시: 테스트 10번째 샘플을 시각화
-sample_idx = 10
+sample_idx = 0
 plot_sic_comparison(pred=test_preds[sample_idx], true=test_trues[sample_idx], idx=sample_idx)
