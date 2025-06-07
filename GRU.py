@@ -1,11 +1,16 @@
 import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import random
 import numpy as np
 import matplotlib.pyplot as plt
+from datetime import datetime
 from tqdm.auto import tqdm
+from netCDF4 import Dataset
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 # Fix Seed
@@ -23,6 +28,7 @@ set_seed(42)
 # Load Data
 climate_file = np.load("./preprocessed/feature_real_final.npz")
 climate_data = climate_file['data']
+
 sic_file = np.load("./preprocessed/NSIDC_seaice_con_199501_202412.npz")
 sic_data = sic_file['sic']
 
@@ -40,83 +46,82 @@ class SeaIceDataset(Dataset):
 
     def __getitem__(self, idx):
         t = self.start + idx
-        seq_climate = self.climate[t-self.L:t]  # (L, 10, H, W)
-        target_sic = self.sic[t]  # (H, W)
-        target_sic = np.expand_dims(target_sic, axis=0)  # (1, H, W)
-        seq_climate = torch.from_numpy(seq_climate).float()
-        target_sic = torch.from_numpy(target_sic).float()
-        return seq_climate, target_sic
+        seq_climate = self.climate[t-self.L : t]   # (L, 10, 428, 300)
+        target_sic = self.sic[t]  # (428, 300)
+        target_sic = np.expand_dims(target_sic, axis=0)  # (1, 428, 300)
+        return torch.from_numpy(seq_climate).float(), torch.from_numpy(target_sic).float()
 
 train_dataset = SeaIceDataset(climate_data, sic_data, 12, 0, 287)
 val_dataset = SeaIceDataset(climate_data, sic_data, 12, 288, 323)
 test_dataset = SeaIceDataset(climate_data, sic_data, 12, 324, 359)
 
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0, pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0, pin_memory=True)
-test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=0, pin_memory=True)
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, pin_memory=True)
 
 # GRU-based Model
 class SeaIceGRU(nn.Module):
-    def __init__(self, input_channels=10, hidden_dim=64, height=428, width=300):
+    def __init__(self, input_channels=10, hidden_size=64, height=428, width=300):
         super(SeaIceGRU, self).__init__()
         self.height = height
         self.width = width
-        self.hidden_dim = hidden_dim
+        self.hidden_size = hidden_size
+        self.input_size = input_channels * height * width
 
-        # GRU input: (B, L, C, H, W) → (B*H*W, L, C)
-        self.gru = nn.GRU(input_size=input_channels, hidden_size=hidden_dim, batch_first=True)
-
-        # Output conv head: (B, H, W, hidden_dim) → (B, 1, H, W)
-        self.conv = nn.Sequential(
-            nn.Conv2d(hidden_dim, 32, kernel_size=3, padding=1),
+        self.gru = nn.GRU(input_size=self.input_size, hidden_size=self.hidden_size, batch_first=True)
+        self.fc = nn.Sequential(
+            nn.Linear(self.hidden_size, 1024),
             nn.ReLU(),
-            nn.Conv2d(32, 1, kernel_size=3, padding=1)
+            nn.Linear(1024, height * width)
         )
 
     def forward(self, x):
         B, L, C, H, W = x.shape
-        x = x.permute(0, 3, 4, 1, 2).contiguous()  # (B, H, W, L, C)
-        x = x.view(B * H * W, L, C)  # (B*H*W, L, C)
-        out, _ = self.gru(x)  # (B*H*W, L, hidden)
-        out = out[:, -1, :]  # (B*H*W, hidden)
-        out = out.view(B, H, W, self.hidden_dim).permute(0, 3, 1, 2)  # (B, hidden, H, W)
-        out = self.conv(out)  # (B, 1, H, W)
-        return out
+        x = x.view(B, L, -1)
+        gru_out, _ = self.gru(x)
+        last_output = gru_out[:, -1, :]
+        out = self.fc(last_output)
+        return out.view(B, 1, H, W)
 
-# Training settings
+# Device setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Model, Loss, Optimizer
 model = SeaIceGRU().to(device)
 criterion = nn.MSELoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
-# Train
-num_epochs = 50
 best_val_loss = float('inf')
-for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress"):
+num_epochs = 50
+
+# Train & Validate
+for epoch in tqdm(range(1, num_epochs + 1), desc="Training Progress"):
     model.train()
-    total_train_loss = 0
-    for x, y in tqdm(train_loader, desc="training"):
-        x, y = x.to(device), y.to(device)
+    total_train_loss = 0.0
+    for seq_climate, target_sic in tqdm(train_loader, desc="Training"):
+        seq_climate, target_sic = seq_climate.to(device), target_sic.to(device)
         optimizer.zero_grad()
-        pred = model(x)
-        loss = criterion(pred, y)
+        pred_sic = model(seq_climate)
+        loss = criterion(pred_sic, target_sic)
         loss.backward()
         optimizer.step()
-        total_train_loss += loss.item() * x.size(0)
+        total_train_loss += loss.item() * seq_climate.size(0)
+
     avg_train_loss = total_train_loss / len(train_loader.dataset)
 
     model.eval()
-    total_val_loss = 0
+    total_val_loss = 0.0
     with torch.no_grad():
-        for x, y in tqdm(val_loader, desc="validation"):
-            x, y = x.to(device), y.to(device)
-            pred = model(x)
-            loss = criterion(pred, y)
-            total_val_loss += loss.item() * x.size(0)
-    avg_val_loss = total_val_loss / len(val_loader.dataset)
+        for seq_climate, target_sic in tqdm(val_loader, desc="Validation"):
+            seq_climate, target_sic = seq_climate.to(device), target_sic.to(device)
+            pred_sic = model(seq_climate)
+            loss = criterion(pred_sic, target_sic)
+            total_val_loss += loss.item() * seq_climate.size(0)
 
+    avg_val_loss = total_val_loss / len(val_loader.dataset)
     scheduler.step(avg_val_loss)
+
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
         torch.save({
@@ -125,7 +130,8 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress"):
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': avg_val_loss
         }, 'best_seaice_gru.pth')
-    print(f"[Epoch {epoch}/{num_epochs}] Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+
+    print(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f} | Val Loss = {avg_val_loss:.6f} | LR = {optimizer.param_groups[0]['lr']:.2e}")
 
 # Test
 checkpoint = torch.load('best_seaice_gru.pth', map_location=device)
@@ -133,36 +139,42 @@ model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
 test_preds, test_trues = [], []
-test_loss = 0
+test_losses = 0.0
+
 with torch.no_grad():
-    for x, y in test_loader:
-        x, y = x.to(device), y.to(device)
-        pred = model(x)
-        loss = criterion(pred, y)
-        test_loss += loss.item() * x.size(0)
-        test_preds.append(pred.cpu().numpy())
-        test_trues.append(y.cpu().numpy())
-avg_test_loss = test_loss / len(test_loader.dataset)
-print(f"Average Test Loss: {avg_test_loss:.6f}")
+    for seq_climate, target_sic in test_loader:
+        seq_climate, target_sic = seq_climate.to(device), target_sic.to(device)
+        pred_sic = model(seq_climate)
+        loss = criterion(pred_sic, target_sic)
+        test_losses += loss.item() * seq_climate.size(0)
+        test_preds.append(pred_sic.cpu().numpy())
+        test_trues.append(target_sic.cpu().numpy())
+
+avg_test_loss = test_losses / len(test_loader.dataset)
+print(f"Average Test Loss = {avg_test_loss:.6f}")
 
 # Visualization
+
 def plot_sic_comparison(pred, true, idx, save_path=None):
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    im0 = axes[0].imshow(np.squeeze(true[0]), vmin=0, vmax=1, cmap='Blues')
+
+    im0 = axes[0].imshow(true[0], vmin=0, vmax=1, cmap='Blues')
     axes[0].set_title(f"Ground Truth (Idx {idx})")
     axes[0].axis('off')
     plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-    im1 = axes[1].imshow(np.squeeze(pred[0]), vmin=0, vmax=1, cmap='Blues')
+
+    im1 = axes[1].imshow(pred[0], vmin=0, vmax=1, cmap='Blues')
     axes[1].set_title(f"Prediction (Idx {idx})")
     axes[1].axis('off')
     plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
     plt.tight_layout()
-    if save_path:
+    if save_path is not None:
         plt.savefig(save_path, dpi=150)
     else:
         plt.show()
     plt.close()
 
-# Show sample prediction
+# 예시 시각화
 sample_idx = 0
 plot_sic_comparison(pred=test_preds[sample_idx], true=test_trues[sample_idx], idx=sample_idx)
