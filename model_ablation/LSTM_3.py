@@ -37,26 +37,25 @@ sic_data = sic_file['sic']
 x_coords = sic_file['x']
 y_coords = sic_file['y']
 dates = sic_file['dates']  # List of dates corresponding to the SIC data
-mask = sic_file['mask']  # (360, 428, 300) (0: False(sea), 1: True(non-sea))
+mask = sic_file['mask']  # (360, 428, 300)
 
 # Additional preprocessing (Z-score normalization, with train_data)
-climate_train = climate_data[:240] 
+climate_train = climate_data[:288] 
+sic_train = sic_data[:288] 
+
 # Feature-wise mean & std
 cm_mean = climate_train.mean(axis=(0,2,3), keepdims=True)
 cm_std = climate_train.std(axis=(0,2,3), keepdims=True)
 
 climate_data = (climate_data - cm_mean) / (cm_std + 1e-6)
 
-## Custom Sea Ice Dataset
-class SeaIceDataset(Dataset):
-    def __init__(self, climate_array, sic_array, mask_array, window_length, prediction_length, start_idx, end_idx):
-        self.climate = climate_array
+## Custom Sea Ice Dataset (Only SIC)
+class SICOnlyDataset(Dataset):
+    def __init__(self, sic_array, mask_array, window_length, prediction_length, start_idx, end_idx):
         self.sic = sic_array
         self.mask = mask_array
-        self.L = window_length                 # Sliding window size
-        self.pred_L = prediction_length         # e.g. 3 or 6
-
-        # only go up to `len - prediction_length`
+        self.L = window_length
+        self.pred_L = prediction_length
         self.start = start_idx + self.L
         self.end = end_idx - (self.pred_L - 1)
 
@@ -65,144 +64,67 @@ class SeaIceDataset(Dataset):
 
     def __getitem__(self, idx):
         t = self.start + idx
+        seq_sic = self.sic[t - self.L : t]              # (L, 428, 300)
+        target_sic = self.sic[t : t + self.pred_L]      # (pred_L, 428, 300)
+        mask = self.mask[t : t + self.pred_L]           # (pred_L, 428, 300)
 
-        # Feature Sequence
-        seq_climate = self.climate[t-self.L : t]   # (L, 10, 428, 300)
-        # Target
-        target_sic = self.sic[t : t + self.pred_L] # (pred_L, 428, 300)
-        # Mask
-        mask = self.mask[t : t + self.pred_L]         # (pred_L, 428, 300)
-        
-        seq_climate = torch.from_numpy(seq_climate).float()
+        seq_sic = torch.from_numpy(seq_sic).unsqueeze(1).float()  # (L, 1, 428, 300)
         target_sic = torch.from_numpy(target_sic).float()
         mask = torch.from_numpy(mask).float()
         valid_mask = 1.0 - mask
 
-        return seq_climate, target_sic, valid_mask
+        return seq_sic, target_sic, valid_mask
 
-train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=0, end_idx=239)
-val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=240, end_idx=299)
-test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=300, end_idx=359)
+train_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=0, end_idx=239)
+val_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=240, end_idx=299)
+test_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=300, end_idx=359)
 
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
 test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
-
-## TCN + U-Net Model Definition (Code by GPT)
-class TCNBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1):
-        super().__init__()
-        pad_t = ((kernel_size - 1) // 2) * dilation
-        self.conv = nn.Conv3d(
-            in_channels, out_channels,
-            kernel_size=(kernel_size, 1, 1),
-            padding=(pad_t, 0, 0),
-            dilation=(dilation, 1, 1),
-            bias=False
-        )
-        self.bn = nn.BatchNorm3d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout3d(0.2)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-        return x
-
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels,  out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(0.2),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(0.2)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-class UNet2D(nn.Module):
-    def __init__(self, in_channels, out_channels, features=[64, 128, 256, 512]):
-        super().__init__()
-        self.downs = nn.ModuleList()
-        ch = in_channels
-        for f in features:
-            self.downs.append(DoubleConv(ch, f))
-            ch = f
-        self.pool = nn.MaxPool2d(2,2)
-
-        self.bottleneck = DoubleConv(features[-1], features[-1]*2)
-
-        self.ups = nn.ModuleList()
-        for f in reversed(features):
-            self.ups.append(nn.ConvTranspose2d(f * 2, f, 2, 2))
-            self.ups.append(DoubleConv(f * 2, f))
-
-        self.final = nn.Conv2d(features[0], out_channels, 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        skips = []
-        for down in self.downs:
-            x = down(x)
-            skips.append(x)
-            x = self.pool(x)
-        x = self.bottleneck(x)
-        skips = skips[::-1]
-        for i in range(0, len(self.ups), 2):
-            x = self.ups[i](x)
-            skip = skips[i // 2]
-            if x.shape != skip.shape:
-                x = F.interpolate(x, size=skip.shape[2:])
-            x = self.ups[i + 1](torch.cat([skip, x], dim=1))
-        x = self.final(x)
-        x = self.sigmoid(x)
-        return x
-
-class SeaIceSTUNet(nn.Module):
-    def __init__(self, input_channels=10, tcn_channels=64, tcn_layers=3, unet_features=[64, 128, 256, 512], pred_L=6):
-        super().__init__()
+## Define Model
+# LSTM-based Model
+class SeaIceLSTM(nn.Module):
+    def __init__(self, input_channels=1, hidden_size=64, height=428, width=300, pred_L=3):
+        super(SeaIceLSTM, self).__init__()
+        self.height = height
+        self.width = width
         self.pred_L = pred_L
-        
-        layers = []
-        ch = input_channels
-        for i in range(tcn_layers):
-            layers.append(TCNBlock(ch, tcn_channels, kernel_size=3, dilation=2**i))
-            ch = tcn_channels
-        self.tcn = nn.Sequential(*layers)
-        self.unet = UNet2D(tcn_channels, pred_L, unet_features)
+        self.hidden_size = hidden_size
+        self.input_size = input_channels * height * width
+
+        self.lstm = nn.LSTM(input_size=self.input_size, hidden_size=self.hidden_size, batch_first=True)
+        self.fc = nn.Sequential(
+            nn.Linear(self.hidden_size, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, pred_L * height * width)
+        )
 
     def forward(self, x):
-        # x: (B, L, C, H, W) → (B, C, L, H, W)
-        x = x.permute(0,2,1,3,4)
-        x = self.tcn(x)           # (B, tcn_channels, L, H, W)
-        x = x[:,:, -1, :, :]      # last time → (B, tcn_channels, H, W)
-        return self.unet(x)       # (B, pred_L, H, W)
-
+        B, L, C, H, W = x.shape
+        x = x.view(B, L, -1)
+        lstm_out, _ = self.lstm(x)
+        last_output = lstm_out[:, -1, :]
+        out = self.fc(last_output)
+        return out.view(B, self.pred_L, H, W)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-num_epochs = 30
-model = SeaIceSTUNet(input_channels=10, tcn_channels=64, tcn_layers=3, unet_features=[64,128,256,512], pred_L=6).to(device)
+num_epochs = 50
+model = SeaIceLSTM(input_channels=1, hidden_size=64, pred_L=3).to(device)
 
+# Loss & Optimizer & Learning rate Scheduler
 criterion = nn.MSELoss(reduction='none')
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
 
 best_val_loss = float('inf')
 
 ## Train & Validation
-for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress", leave=True):
+for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress"):
     # Train
     model.train()
     total_train_loss = 0.0
-    for seq_climate, target_sic, mask in tqdm(train_loader, desc="training", leave=False):
+    for seq_climate, target_sic, mask in tqdm(train_loader, desc="training"):
         seq_climate = seq_climate.to(device) # (B, L, 10, 428, 300)
         target_sic  = target_sic.to(device) # (B, pred_L, 428, 300)
         mask = mask.to(device) # (B, pred_L, 428, 300)
@@ -221,7 +143,7 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress", leave=True):
     model.eval()
     total_val_loss = 0.0
     with torch.no_grad():
-        for seq_climate, target_sic, mask in tqdm(val_loader, desc="validation", leave=False):
+        for seq_climate, target_sic, mask in tqdm(val_loader, desc="validation"):
             seq_climate = seq_climate.to(device)
             target_sic = target_sic.to(device)
             mask = mask.to(device) # (B, pred_L, 428, 300)
@@ -241,12 +163,12 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress", leave=True):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': avg_val_loss
-        }, 'best_seaice_UNet.pth')
+        }, 'best_seaice_LSTM_3_SICOnly.pth')
 
-    tqdm.write(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
+    print(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
 
 ## Test & Visualization
-checkpoint = torch.load('best_seaice_UNet.pth', map_location=device)
+checkpoint = torch.load('best_seaice_LSTM_3_SICOnly.pth', map_location=device)
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
@@ -271,15 +193,16 @@ with torch.no_grad():
 avg_test_loss = test_losses / len(test_loader.dataset)
 print(f"Average Test Loss = {avg_test_loss:.6f}")
 
-def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/STUNet_6'):
+# Visualization
+def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/LSTM_3_SICOnly'):
     os.makedirs(save_dir, exist_ok=True)
 
     N, L, _, _ = pred.shape
     X, Y = np.meshgrid(x_coords, y_coords)
 
     for i in tqdm(range(N), desc="Visualizing...", leave=False):
-        fig, axes = plt.subplots(1, L, figsize=(6 * L, 10))
-
+        fig, axes = plt.subplots(1, 3, figsize=(24, 10))
+        
         for h in range(L):
             diff_map = true[i, h] - pred[i, h]
             masked_diff_map = np.where(mask[i, h] == 1, diff_map, 0)
@@ -300,14 +223,13 @@ def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, s
 
         input_start = dates[start_idx + i - 12]
         input_end = dates[start_idx + i - 1]
-        fig.suptitle(f'Sample {i+1}: Input ({input_start} ~ {input_end}) → 6-Month Prediction', fontsize=16)
+        fig.suptitle(f'Sample {i+1}: Input ({input_start} ~ {input_end}) → 3-Month Prediction', fontsize=16)
 
         pred_start = dates[start_idx + i]
-        pred_end = dates[start_idx + i + L - 1]
+        pred_end = dates[start_idx + i + 2]
         fname = f'sic_error_map_{pred_start}_to_{pred_end}_sample_{i+1:03d}.png'
         plt.savefig(os.path.join(save_dir, fname), bbox_inches='tight')
         plt.close()
-
 
     
 # Print Visualization
@@ -317,5 +239,5 @@ test_pred_vis = np.concatenate(test_preds, axis=0)
 test_true_vis = np.concatenate(test_trues, axis=0)
 test_mask_vis = torch.cat([m for _, _, m in test_loader], dim=0).numpy()
 
-# Visualize in Pred_L(6 months)
+# Visualize in Pred_L(3 months)
 plot_sic_error_map(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx)
