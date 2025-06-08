@@ -114,7 +114,7 @@ class SeaIceLSTM(nn.Module):
         return out.view(B, self.pred_L, H, W)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-num_epochs = 50
+num_epochs = 30
 model = SeaIceLSTM(input_channels=10, hidden_size=64, pred_L=3).to(device)
 
 # Loss & Optimizer & Learning rate Scheduler

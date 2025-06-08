@@ -40,8 +40,7 @@ dates = sic_file['dates']  # List of dates corresponding to the SIC data
 mask = sic_file['mask']  # (360, 428, 300)
 
 # Additional preprocessing (Z-score normalization, with train_data)
-climate_train = climate_data[:288] 
-sic_train = sic_data[:288] 
+climate_train = climate_data[:240] 
 
 # Feature-wise mean & std
 cm_mean = climate_train.mean(axis=(0,2,3), keepdims=True)
@@ -111,7 +110,7 @@ class SeaIceTransformer(nn.Module):
         return out.view(B, self.pred_L, H, W)  # (B, pred_L, H, W)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-num_epochs = 50
+num_epochs = 30
 model = SeaIceTransformer(input_channels=1, pred_L=6).to(device)
 
 # Loss & Optimizer & Learning rate Scheduler

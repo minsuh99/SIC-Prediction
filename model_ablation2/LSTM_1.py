@@ -41,19 +41,22 @@ mask = sic_file['mask']  # (360, 428, 300)
 
 # Additional preprocessing (Z-score normalization, with train_data)
 climate_train = climate_data[:240] 
+
 # Feature-wise mean & std
 cm_mean = climate_train.mean(axis=(0,2,3), keepdims=True)
 cm_std = climate_train.std(axis=(0,2,3), keepdims=True)
 
 climate_data = (climate_data - cm_mean) / (cm_std + 1e-6)
 
-## Custom Sea Ice Dataset (Only SIC)
-class SICOnlyDataset(Dataset):
-    def __init__(self, sic_array, mask_array, window_length, prediction_length, start_idx, end_idx):
+## Custom Sea Ice Dataset (Climate + SIC)
+class ClimateSICDataset(Dataset):
+    def __init__(self, climate_array, sic_array, mask_array, window_length, prediction_length, start_idx, end_idx):
+        self.climate = climate_array
         self.sic = sic_array
         self.mask = mask_array
         self.L = window_length
         self.pred_L = prediction_length
+
         self.start = start_idx + self.L
         self.end = end_idx - (self.pred_L - 1)
 
@@ -62,37 +65,40 @@ class SICOnlyDataset(Dataset):
 
     def __getitem__(self, idx):
         t = self.start + idx
-        seq_sic = self.sic[t - self.L : t]              # (L, 428, 300)
-        target_sic = self.sic[t : t + self.pred_L]      # (pred_L, 428, 300)
-        mask = self.mask[t : t + self.pred_L]           # (pred_L, 428, 300)
-
-        seq_sic = torch.from_numpy(seq_sic).unsqueeze(1).float()  # (L, 1, 428, 300)
+        seq_climate = self.climate[t - self.L : t]       # (L, 10, 428, 300)
+        seq_sic = self.sic[t - self.L : t]               # (L, 428, 300)
+        target_sic = self.sic[t : t + self.pred_L]       # (pred_L, 428, 300)
+        mask = self.mask[t : t + self.pred_L]            # (pred_L, 428, 300)
+        
+        seq_sic_expanded = np.expand_dims(seq_sic, axis=1)  # (L, 1, 428, 300)
+        seq_input = np.concatenate([seq_climate, seq_sic_expanded], axis=1)  # (L, 11, 428, 300)
+        
+        seq_input = torch.from_numpy(seq_input).float()   # (L, 11, 428, 300)
         target_sic = torch.from_numpy(target_sic).float()
         mask = torch.from_numpy(mask).float()
         valid_mask = 1.0 - mask
 
-        return seq_sic, target_sic, valid_mask
+        return seq_input, target_sic, valid_mask
 
-
-train_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=0, end_idx=239)
-val_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=240, end_idx=299)
-test_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=300, end_idx=359)
+train_dataset = ClimateSICDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=0, end_idx=239)
+val_dataset = ClimateSICDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=240, end_idx=299)
+test_dataset = ClimateSICDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=300, end_idx=359)
 
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
 test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
 ## Define Model
-# GRU-based Model
-class SeaIceGRU(nn.Module):
-    def __init__(self, input_channels=1, hidden_size=64, height=428, width=300, pred_L=3):
-        super(SeaIceGRU, self).__init__()
+# LSTM-based Model
+class SeaIceLSTM(nn.Module):
+    def __init__(self, input_channels=11, hidden_size=64, height=428, width=300, pred_L=1):
+        super(SeaIceLSTM, self).__init__()
         self.height = height
         self.width = width
         self.pred_L = pred_L
         self.hidden_size = hidden_size
         self.input_size = input_channels * height * width
 
-        self.gru = nn.GRU(input_size=self.input_size, hidden_size=self.hidden_size, batch_first=True)
+        self.lstm = nn.LSTM(input_size=self.input_size, hidden_size=self.hidden_size, batch_first=True)
         self.fc = nn.Sequential(
             nn.Linear(self.hidden_size, 1024),
             nn.ReLU(),
@@ -102,14 +108,14 @@ class SeaIceGRU(nn.Module):
     def forward(self, x):
         B, L, C, H, W = x.shape
         x = x.view(B, L, -1)
-        gru_out, _ = self.gru(x)
-        last_output = gru_out[:, -1, :]
+        lstm_out, _ = self.lstm(x)
+        last_output = lstm_out[:, -1, :]
         out = self.fc(last_output)
         return out.view(B, self.pred_L, H, W)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_epochs = 30
-model = SeaIceGRU(input_channels=1, hidden_size=64, pred_L=3).to(device)
+model = SeaIceLSTM(input_channels=11, hidden_size=64, pred_L=1).to(device)
 
 # Loss & Optimizer & Learning rate Scheduler
 criterion = nn.MSELoss(reduction='none')
@@ -162,12 +168,12 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress"):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': avg_val_loss
-        }, 'best_seaice_GRU_3.pth')
+        }, 'best_seaice_LSTM_1_Climate_SIC.pth')
 
     print(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
 
 ## Test & Visualization
-checkpoint = torch.load('best_seaice_GRU_3.pth', map_location=device)
+checkpoint = torch.load('best_seaice_LSTM_1_Climate_SIC.pth', map_location=device)
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
@@ -192,29 +198,27 @@ with torch.no_grad():
 avg_test_loss = test_losses / len(test_loader.dataset)
 print(f"Average Test Loss = {avg_test_loss:.6f}")
 
-# Visualization
-def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/GRU_3'):
+def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/LSTM_1_Climate_SIC'):
     os.makedirs(save_dir, exist_ok=True)
 
     N, L, _, _ = pred.shape
     X, Y = np.meshgrid(x_coords, y_coords)
 
     for i in tqdm(range(N), desc="Visualizing...", leave=False):
-        fig, axes = plt.subplots(1, 3, figsize=(24, 10))
-        
-        for h in range(L):
-            diff_map = true[i, h] - pred[i, h]
-            masked_diff_map = np.where(mask[i, h] == 1, diff_map, 0)
-            date_str = dates[start_idx + i + h]
+        fig, ax = plt.subplots(1, 1, figsize=(8, 10))
+        diff_map = true[i, 0] - pred[i, 0]
+        masked_diff_map = np.where(mask[i, 0] == 1, diff_map, 0)
+        date_str = dates[start_idx + i]
 
-            cmap = plt.get_cmap('bwr').copy()
-            cmap.set_bad(color='gray')
-            im = axes[h].pcolormesh(X, Y, masked_diff_map, cmap=cmap, vmin=-1, vmax=1, shading='auto')
-            axes[h].set_title(f'{date_str}', fontsize=14)
-            axes[h].set_xlabel('X (km)')
-            axes[h].set_ylabel('Y (km)')
+        cmap = plt.get_cmap('bwr').copy()
+        cmap.set_bad('gray')
 
-            print(masked_diff_map.min(), masked_diff_map.max())
+        im = ax.pcolormesh(X, Y, masked_diff_map, cmap=cmap, vmin=-1, vmax=1, shading='auto')
+        ax.set_title(f'{date_str}', fontsize=14)
+        ax.set_xlabel('X (km)')
+        ax.set_ylabel('Y (km)')
+
+        print(masked_diff_map.min(), masked_diff_map.max())
 
         fig.subplots_adjust(right=0.92)
         cbar_ax = fig.add_axes([0.94, 0.15, 0.02, 0.7])
@@ -222,13 +226,13 @@ def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, s
 
         input_start = dates[start_idx + i - 12]
         input_end = dates[start_idx + i - 1]
-        fig.suptitle(f'Sample {i+1}: Input ({input_start} ~ {input_end}) → 3-Month Prediction', fontsize=16)
+        fig.suptitle(f'Sample {i+1}: Input ({input_start} ~ {input_end}) → 1-Month Prediction', fontsize=16)
 
-        pred_start = dates[start_idx + i]
-        pred_end = dates[start_idx + i + 2]
-        fname = f'sic_error_map_{pred_start}_to_{pred_end}_sample_{i+1:03d}.png'
+        pred_date = dates[start_idx + i]
+        fname = f'sic_error_map_{pred_date}_sample_{i+1:03d}.png'
         plt.savefig(os.path.join(save_dir, fname), bbox_inches='tight')
         plt.close()
+
 
     
 # Print Visualization
@@ -238,5 +242,5 @@ test_pred_vis = np.concatenate(test_preds, axis=0)
 test_true_vis = np.concatenate(test_trues, axis=0)
 test_mask_vis = torch.cat([m for _, _, m in test_loader], dim=0).numpy()
 
-# Visualize in Pred_L(3 months)
+# Visualize in Pred_L(1 month)
 plot_sic_error_map(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx)
