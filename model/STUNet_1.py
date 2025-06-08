@@ -241,12 +241,12 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress", leave=True):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': avg_val_loss
-        }, 'best_seaice_STUNet.pth')
+        }, 'best_seaice_STUNet_1.pth')
 
     tqdm.write(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
 
 ## Test & Visualization
-checkpoint = torch.load('best_seaice_STUNet.pth', map_location=device)
+checkpoint = torch.load('best_seaice_STUNet_1.pth', map_location=device)
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 

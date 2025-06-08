@@ -265,12 +265,12 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress", leave=True):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': avg_val_loss
-        }, 'best_seaice_convlstm_6.pth')
+        }, 'best_seaice_convlstm_6_SICOnly.pth')
 
     tqdm.write(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
 ## Test & Visualization
 
-checkpoint = torch.load('best_seaice_convlstm_6.pth', map_location=device)
+checkpoint = torch.load('best_seaice_convlstm_6_SICOnly.pth', map_location=device)
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
@@ -296,7 +296,7 @@ avg_test_loss = test_losses / len(test_loader.dataset)
 print(f"Average Test Loss = {avg_test_loss:.6f}")
 
 # Visualization
-def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/ConvLSTM_6'):
+def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/ConvLSTM_6_SICOnly'):
     os.makedirs(save_dir, exist_ok=True)
 
     N, L, _, _ = pred.shape
