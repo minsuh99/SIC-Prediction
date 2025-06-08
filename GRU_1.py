@@ -78,12 +78,13 @@ class SeaIceDataset(Dataset):
         seq_climate = torch.from_numpy(seq_climate).float()
         target_sic = torch.from_numpy(target_sic).float()
         mask = torch.from_numpy(mask).float()
+        valid_mask = 1.0 - mask
 
-        return seq_climate, target_sic, mask
+        return seq_climate, target_sic, valid_mask
 
-train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=0, end_idx=287)
-val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=288, end_idx=323)
-test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=324, end_idx=359)
+train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=0, end_idx=239)
+val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=240, end_idx=299)
+test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=300, end_idx=359)
 
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
@@ -91,10 +92,11 @@ test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=
 ## Define Model
 # GRU-based Model
 class SeaIceGRU(nn.Module):
-    def __init__(self, input_channels=10, hidden_size=64, height=428, width=300):
+    def __init__(self, input_channels=10, hidden_size=64, height=428, width=300, pred_L=1):
         super(SeaIceGRU, self).__init__()
         self.height = height
         self.width = width
+        self.pred_L = pred_L
         self.hidden_size = hidden_size
         self.input_size = input_channels * height * width
 
@@ -102,7 +104,7 @@ class SeaIceGRU(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(self.hidden_size, 1024),
             nn.ReLU(),
-            nn.Linear(1024, height * width)
+            nn.Linear(1024, pred_L * height * width)
         )
 
     def forward(self, x):
@@ -111,11 +113,11 @@ class SeaIceGRU(nn.Module):
         gru_out, _ = self.gru(x)
         last_output = gru_out[:, -1, :]
         out = self.fc(last_output)
-        return out.view(B, 1, H, W)
+        return out.view(B, self.pred_L, H, W)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_epochs = 50
-model = SeaIceGRU(input_channels=10, hidden_size=64).to(device)
+model = SeaIceGRU(input_channels=10, hidden_size=64, pred_L=1).to(device)
 
 # Loss & Optimizer & Learning rate Scheduler
 criterion = nn.MSELoss(reduction='none')
@@ -198,29 +200,41 @@ with torch.no_grad():
 avg_test_loss = test_losses / len(test_loader.dataset)
 print(f"Average Test Loss = {avg_test_loss:.6f}")
 
-# Visualization
-def plot_sic_error_map(pred, true, x_coords, y_coords, dates, start_idx, save_dir='./results/GRU_1'): # 여기 수정 필요
+def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/GRU_1'):
     os.makedirs(save_dir, exist_ok=True)
 
     N, L, _, _ = pred.shape
     X, Y = np.meshgrid(x_coords, y_coords)
 
-    for i in range(N):
-        for h in range(L):
-            diff_map = true[i, h] - pred[i, h]
-            date_str = dates[start_idx + i + h]
-            fname = f'sic_error_map_{date_str}.png'
+    for i in tqdm(range(N), desc="Visualizing...", leave=False):
+        fig, ax = plt.subplots(1, 1, figsize=(8, 10))
+        diff_map = true[i, 0] - pred[i, 0]
+        masked_diff_map = np.where(mask[i, 0] == 1, diff_map, 0)
+        date_str = dates[start_idx + i]
 
-            plt.figure(figsize=(8, 10))
-            im = plt.pcolormesh(X, Y, diff_map, cmap='bwr', vmin=-0.3, vmax=0.3, shading='auto')
-            plt.colorbar(im, label='True − Predicted')
-            plt.title(f'SIC Error – {date_str}')
-            plt.xlabel('X (km)')
-            plt.ylabel('Y (km)')
-            plt.tight_layout()
+        cmap = plt.get_cmap('bwr').copy()
+        cmap.set_bad('gray')
 
-            plt.savefig(os.path.join(save_dir, fname))
-            plt.close()
+        im = ax.pcolormesh(X, Y, masked_diff_map, cmap=cmap, vmin=-1, vmax=1, shading='auto')
+        ax.set_title(f'{date_str}', fontsize=14)
+        ax.set_xlabel('X (km)')
+        ax.set_ylabel('Y (km)')
+
+        print(masked_diff_map.min(), masked_diff_map.max())
+
+        fig.subplots_adjust(right=0.92)
+        cbar_ax = fig.add_axes([0.94, 0.15, 0.02, 0.7])
+        plt.colorbar(im, cax=cbar_ax, label='True − Predicted')
+
+        input_start = dates[start_idx + i - 12]
+        input_end = dates[start_idx + i - 1]
+        fig.suptitle(f'Sample {i+1}: Input ({input_start} ~ {input_end}) → 1-Month Prediction', fontsize=16)
+
+        pred_date = dates[start_idx + i]
+        fname = f'sic_error_map_{pred_date}_sample_{i+1:03d}.png'
+        plt.savefig(os.path.join(save_dir, fname), bbox_inches='tight')
+        plt.close()
+
 
     
 # Print Visualization
@@ -228,6 +242,7 @@ L = test_dataset.L
 test_start_idx = test_dataset.start
 test_pred_vis = np.concatenate(test_preds, axis=0)
 test_true_vis = np.concatenate(test_trues, axis=0)
+test_mask_vis = torch.cat([m for _, _, m in test_loader], dim=0).numpy()
 
-# Visualize the prediction_step (0, first month) in Pred_L(3 months)
-plot_sic_error_map(pred=test_pred_vis, true=test_true_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx)
+# Visualize in Pred_L(1 month)
+plot_sic_error_map(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx)

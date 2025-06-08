@@ -80,9 +80,9 @@ class SeaIceDataset(Dataset):
 
         return seq_climate, target_sic, valid_mask
 
-train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=0, end_idx=239)
-val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=240, end_idx=299)
-test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=300, end_idx=359)
+train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=0, end_idx=239)
+val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=240, end_idx=299)
+test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=300, end_idx=359)
 
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
@@ -146,6 +146,7 @@ class UNet2D(nn.Module):
             self.ups.append(DoubleConv(f * 2, f))
 
         self.final = nn.Conv2d(features[0], out_channels, 1)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         skips = []
@@ -161,10 +162,12 @@ class UNet2D(nn.Module):
             if x.shape != skip.shape:
                 x = F.interpolate(x, size=skip.shape[2:])
             x = self.ups[i + 1](torch.cat([skip, x], dim=1))
-        return self.final(x)
+        x = self.final(x)
+        x = self.sigmoid(x)
+        return x
 
-class SeaIceUNetTCN(nn.Module):
-    def __init__(self, input_channels=10, tcn_channels=64, tcn_layers=3, unet_features=[64, 128, 256, 512], pred_L=3):
+class SeaIceSTUNet(nn.Module):
+    def __init__(self, input_channels=10, tcn_channels=64, tcn_layers=3, unet_features=[64, 128, 256, 512], pred_L=6):
         super().__init__()
         self.pred_L = pred_L
         
@@ -186,7 +189,7 @@ class SeaIceUNetTCN(nn.Module):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_epochs = 30
-model = SeaIceUNetTCN(input_channels=10, tcn_channels=64, tcn_layers=3, unet_features=[64,128,256,512], pred_L=3).to(device)
+model = SeaIceSTUNet(input_channels=10, tcn_channels=64, tcn_layers=3, unet_features=[64,128,256,512], pred_L=6).to(device)
 
 criterion = nn.MSELoss(reduction='none')
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
@@ -268,30 +271,43 @@ with torch.no_grad():
 avg_test_loss = test_losses / len(test_loader.dataset)
 print(f"Average Test Loss = {avg_test_loss:.6f}")
 
-# Visualization
-def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/UNet'):
+def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/STUNet_6'):
     os.makedirs(save_dir, exist_ok=True)
 
     N, L, _, _ = pred.shape
     X, Y = np.meshgrid(x_coords, y_coords)
 
     for i in tqdm(range(N), desc="Visualizing...", leave=False):
+        fig, axes = plt.subplots(1, L, figsize=(6 * L, 10))
+
         for h in range(L):
             diff_map = true[i, h] - pred[i, h]
-            masked_diff_map = np.where(mask[i, h] == 1, diff_map, np.nan)
+            masked_diff_map = np.where(mask[i, h] == 1, diff_map, 0)
             date_str = dates[start_idx + i + h]
-            fname = f'sic_error_map_{date_str}.png'
 
-            plt.figure(figsize=(8, 10))
-            im = plt.pcolormesh(X, Y, masked_diff_map, cmap='bwr', vmin=-1, vmax=1, shading='auto')
-            plt.colorbar(im, label='True − Predicted')
-            plt.title(f'SIC Error – {date_str}')
-            plt.xlabel('X (km)')
-            plt.ylabel('Y (km)')
-            plt.tight_layout()
+            cmap = plt.get_cmap('bwr').copy()
+            cmap.set_bad(color='gray')
+            im = axes[h].pcolormesh(X, Y, masked_diff_map, cmap=cmap, vmin=-1, vmax=1, shading='auto')
+            axes[h].set_title(f'{date_str}', fontsize=14)
+            axes[h].set_xlabel('X (km)')
+            axes[h].set_ylabel('Y (km)')
 
-            plt.savefig(os.path.join(save_dir, fname))
-            plt.close()
+            print(masked_diff_map.min(), masked_diff_map.max())
+
+        fig.subplots_adjust(right=0.92)
+        cbar_ax = fig.add_axes([0.94, 0.15, 0.02, 0.7])
+        plt.colorbar(im, cax=cbar_ax, label='True − Predicted')
+
+        input_start = dates[start_idx + i - 12]
+        input_end = dates[start_idx + i - 1]
+        fig.suptitle(f'Sample {i+1}: Input ({input_start} ~ {input_end}) → 6-Month Prediction', fontsize=16)
+
+        pred_start = dates[start_idx + i]
+        pred_end = dates[start_idx + i + L - 1]
+        fname = f'sic_error_map_{pred_start}_to_{pred_end}_sample_{i+1:03d}.png'
+        plt.savefig(os.path.join(save_dir, fname), bbox_inches='tight')
+        plt.close()
+
 
     
 # Print Visualization
@@ -301,5 +317,5 @@ test_pred_vis = np.concatenate(test_preds, axis=0)
 test_true_vis = np.concatenate(test_trues, axis=0)
 test_mask_vis = torch.cat([m for _, _, m in test_loader], dim=0).numpy()
 
-# Visualize the prediction_step (0, first month) in Pred_L(3 months)
+# Visualize in Pred_L(6 months)
 plot_sic_error_map(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx)
