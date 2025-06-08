@@ -49,16 +49,13 @@ cm_std = climate_train.std(axis=(0,2,3), keepdims=True)
 
 climate_data = (climate_data - cm_mean) / (cm_std + 1e-6)
 
-## Custom Sea Ice Dataset
-class SeaIceDataset(Dataset):
-    def __init__(self, climate_array, sic_array, mask_array, window_length, prediction_length, start_idx, end_idx):
-        self.climate = climate_array
+## Custom Sea Ice Dataset (Only SIC)
+class SICOnlyDataset(Dataset):
+    def __init__(self, sic_array, mask_array, window_length, prediction_length, start_idx, end_idx):
         self.sic = sic_array
         self.mask = mask_array
-        self.L = window_length                 # Sliding window size
-        self.pred_L = prediction_length         # e.g. 3 or 6
-
-        # only go up to `len - prediction_length`
+        self.L = window_length
+        self.pred_L = prediction_length
         self.start = start_idx + self.L
         self.end = end_idx - (self.pred_L - 1)
 
@@ -67,24 +64,20 @@ class SeaIceDataset(Dataset):
 
     def __getitem__(self, idx):
         t = self.start + idx
+        seq_sic = self.sic[t - self.L : t]              # (L, 428, 300)
+        target_sic = self.sic[t : t + self.pred_L]      # (pred_L, 428, 300)
+        mask = self.mask[t : t + self.pred_L]           # (pred_L, 428, 300)
 
-        # Feature Sequence
-        seq_climate = self.climate[t-self.L : t]   # (L, 10, 428, 300)
-        # Target
-        target_sic = self.sic[t : t + self.pred_L] # (pred_L, 428, 300)
-        # Mask
-        mask = self.mask[t : t + self.pred_L]         # (pred_L, 428, 300)
-        
-        seq_climate = torch.from_numpy(seq_climate).float()
+        seq_sic = torch.from_numpy(seq_sic).unsqueeze(1).float()  # (L, 1, 428, 300)
         target_sic = torch.from_numpy(target_sic).float()
         mask = torch.from_numpy(mask).float()
         valid_mask = 1.0 - mask
 
-        return seq_climate, target_sic, valid_mask
+        return seq_sic, target_sic, valid_mask
 
-train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=0, end_idx=287)
-val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=288, end_idx=323)
-test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=324, end_idx=359)
+train_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=0, end_idx=287)
+val_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=288, end_idx=323)
+test_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=324, end_idx=359)
 
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
@@ -92,7 +85,7 @@ test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=
 ## Define Model
 # LSTM-based Model
 class SeaIceLSTM(nn.Module):
-    def __init__(self, input_channels=10, hidden_size=64, height=428, width=300, pred_L=6):
+    def __init__(self, input_channels=1, hidden_size=64, height=428, width=300, pred_L=6):
         super(SeaIceLSTM, self).__init__()
         self.height = height
         self.width = width
@@ -117,7 +110,7 @@ class SeaIceLSTM(nn.Module):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_epochs = 50
-model = SeaIceLSTM(input_channels=10, hidden_size=64, pred_L=6).to(device)
+model = SeaIceLSTM(input_channels=1, hidden_size=64, pred_L=6).to(device)
 
 # Loss & Optimizer & Learning rate Scheduler
 criterion = nn.MSELoss(reduction='none')
