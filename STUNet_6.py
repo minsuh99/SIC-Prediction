@@ -44,6 +44,7 @@ climate_train = climate_data[:240]
 # Feature-wise mean & std
 cm_mean = climate_train.mean(axis=(0,2,3), keepdims=True)
 cm_std = climate_train.std(axis=(0,2,3), keepdims=True)
+
 climate_data = (climate_data - cm_mean) / (cm_std + 1e-6)
 
 ## Custom Sea Ice Dataset
@@ -79,147 +80,116 @@ class SeaIceDataset(Dataset):
 
         return seq_climate, target_sic, valid_mask
 
-train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=0, end_idx=239)
-val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=240, end_idx=299)
-test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=300, end_idx=359)
+train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=0, end_idx=239)
+val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=240, end_idx=299)
+test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=300, end_idx=359)
 
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
 test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
-## Define Model
-# Code by GPT to reproduce the paper
-class ConvLSTMCell(nn.Module):
-    def __init__(self, input_dim, hidden_dim, kernel_size, bias=True):
-        super(ConvLSTMCell, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.kernel_size = kernel_size
-        self.padding = kernel_size[0] // 2, kernel_size[1] // 2
-        self.bias = bias
 
-        self.conv = nn.Conv2d(
-            in_channels=self.input_dim + self.hidden_dim,
-            out_channels=4 * self.hidden_dim,
-            kernel_size=self.kernel_size,
-            padding=self.padding,
-            bias=self.bias
+## TCN + U-Net Model Definition (Code by GPT)
+class TCNBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1):
+        super().__init__()
+        pad_t = ((kernel_size - 1) // 2) * dilation
+        self.conv = nn.Conv3d(
+            in_channels, out_channels,
+            kernel_size=(kernel_size, 1, 1),
+            padding=(pad_t, 0, 0),
+            dilation=(dilation, 1, 1),
+            bias=False
         )
-        self.dropout = nn.Dropout2d(0.2)
+        self.bn = nn.BatchNorm3d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout3d(0.2)
 
-    def forward(self, x, h_prev, c_prev):
-        combined = torch.cat([x, h_prev], dim=1)
-        combined_conv = self.conv(combined)
-        combined_conv = self.dropout(combined_conv)
-        cc_i, cc_f, cc_g, cc_o = torch.split(combined_conv, self.hidden_dim, dim=1)
-        i = torch.sigmoid(cc_i)
-        f = torch.sigmoid(cc_f)
-        g = torch.tanh(cc_g)
-        o = torch.sigmoid(cc_o)
-        c_next = f * c_prev + i * g
-        h_next = o * torch.tanh(c_next)
-        return h_next, c_next
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        return x
 
-class ConvLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dims, kernel_size, num_layers, batch_first=False, bias=True, return_all_layers=False):
-        super(ConvLSTM, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dims = hidden_dims
-        self.kernel_size = kernel_size
-        self.num_layers = num_layers
-        self.batch_first = batch_first
-        self.bias = bias
-        self.return_all_layers = return_all_layers
-
-        layers = []
-        for i in range(num_layers):
-            cur_input_dim = self.input_dim if i == 0 else self.hidden_dims[i - 1]
-            layers.append(
-                ConvLSTMCell(
-                    input_dim=cur_input_dim,
-                    hidden_dim=self.hidden_dims[i],
-                    kernel_size=self.kernel_size[i],
-                    bias=self.bias
-                )
-            )
-        self.cell_list = nn.ModuleList(layers)
-
-    def forward(self, x, hidden_states=None):
-        if not self.batch_first:
-            x = x.permute(1, 0, 2, 3, 4)  # (L, B, C, H, W) → (B, L, C, H, W)
-
-        batch_size, seq_len, _, height, width = x.size()
-
-        if hidden_states is None:
-            hidden_states = []
-            for i in range(self.num_layers):
-                h = torch.zeros(batch_size, self.hidden_dims[i], height, width, device=x.device)
-                c = torch.zeros(batch_size, self.hidden_dims[i], height, width, device=x.device)
-                hidden_states.append((h, c))
-
-        layer_output_list = []
-        last_state_list = []
-
-        cur_input = x
-        for layer_idx in range(self.num_layers):
-            h, c = hidden_states[layer_idx]
-            output_inner = []
-            for t in range(seq_len):
-                x_t = cur_input[:, t, :, :, :]
-                h, c = self.cell_list[layer_idx](x_t, h, c)
-                output_inner.append(h)
-            layer_output = torch.stack(output_inner, dim=1)
-            layer_output_list.append(layer_output)
-            last_state_list.append((h, c))
-            cur_input = layer_output
-
-        if not self.return_all_layers:
-            layer_output_list = layer_output_list[-1:]
-            last_state_list = last_state_list[-1:]
-
-        return layer_output_list, last_state_list
-
-class SeaIceConvLSTM(nn.Module):
-    def __init__(self, input_channels=10, hidden_channels=64, kernel_size=(3, 3), lstm_layers=1, pred_L=3, bias=True):
-        super(SeaIceConvLSTM, self).__init__()
-
-        self.pred_L = pred_L
-
-        self.convlstm = ConvLSTM(
-            input_dim=input_channels,
-            hidden_dims=[hidden_channels] * lstm_layers,
-            kernel_size=[kernel_size] * lstm_layers,
-            num_layers=lstm_layers,
-            batch_first=True,
-            bias=bias,
-            return_all_layers=False
-        )
-
-        self.conv_head = nn.Sequential(
-            nn.Conv2d(hidden_channels, 32, kernel_size=3, padding=1, bias=bias),
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels,  out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             nn.Dropout2d(0.2),
-            nn.Conv2d(32, 1, kernel_size=3, padding=1, bias=bias)
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.2)
         )
 
     def forward(self, x):
-        layer_output_list, _ = self.convlstm(x)  # (B, L, H, W)
-        hidden_seq = layer_output_list[0]        # (B, L, C, H, W)
+        return self.net(x)
 
-        last_outputs = hidden_seq[:, -self.pred_L:, :, :, :]  # (B, pred_L, C, H, W)
+class UNet2D(nn.Module):
+    def __init__(self, in_channels, out_channels, features=[64, 128, 256, 512]):
+        super().__init__()
+        self.downs = nn.ModuleList()
+        ch = in_channels
+        for f in features:
+            self.downs.append(DoubleConv(ch, f))
+            ch = f
+        self.pool = nn.MaxPool2d(2,2)
 
-        preds = []
-        for t in range(self.pred_L):
-            h_t = last_outputs[:, t]  # (B, C, H, W)
-            pred_t = self.conv_head(h_t)  # (B, 1, H, W)
-            preds.append(pred_t)
+        self.bottleneck = DoubleConv(features[-1], features[-1]*2)
 
-        out = torch.stack(preds, dim=1)  # (B, pred_L, 1, H, W)
-        return out.squeeze(2)            # (B, pred_L, H, W)
+        self.ups = nn.ModuleList()
+        for f in reversed(features):
+            self.ups.append(nn.ConvTranspose2d(f * 2, f, 2, 2))
+            self.ups.append(DoubleConv(f * 2, f))
+
+        self.final = nn.Conv2d(features[0], out_channels, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        skips = []
+        for down in self.downs:
+            x = down(x)
+            skips.append(x)
+            x = self.pool(x)
+        x = self.bottleneck(x)
+        skips = skips[::-1]
+        for i in range(0, len(self.ups), 2):
+            x = self.ups[i](x)
+            skip = skips[i // 2]
+            if x.shape != skip.shape:
+                x = F.interpolate(x, size=skip.shape[2:])
+            x = self.ups[i + 1](torch.cat([skip, x], dim=1))
+        x = self.final(x)
+        x = self.sigmoid(x)
+        return x
+
+class SeaIceSTUNet(nn.Module):
+    def __init__(self, input_channels=10, tcn_channels=64, tcn_layers=3, unet_features=[64, 128, 256, 512], pred_L=6):
+        super().__init__()
+        self.pred_L = pred_L
+        
+        layers = []
+        ch = input_channels
+        for i in range(tcn_layers):
+            layers.append(TCNBlock(ch, tcn_channels, kernel_size=3, dilation=2**i))
+            ch = tcn_channels
+        self.tcn = nn.Sequential(*layers)
+        self.unet = UNet2D(tcn_channels, pred_L, unet_features)
+
+    def forward(self, x):
+        # x: (B, L, C, H, W) → (B, C, L, H, W)
+        x = x.permute(0,2,1,3,4)
+        x = self.tcn(x)           # (B, tcn_channels, L, H, W)
+        x = x[:,:, -1, :, :]      # last time → (B, tcn_channels, H, W)
+        return self.unet(x)       # (B, pred_L, H, W)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_epochs = 30
-model = SeaIceConvLSTM(input_channels=10, hidden_channels=64, kernel_size=(3,3), lstm_layers=1, pred_L=3, bias=True).to(device)
+model = SeaIceSTUNet(input_channels=10, tcn_channels=64, tcn_layers=3, unet_features=[64,128,256,512], pred_L=6).to(device)
 
 criterion = nn.MSELoss(reduction='none')
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
@@ -271,12 +241,12 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress", leave=True):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': avg_val_loss
-        }, 'best_seaice_convlstm_3.pth')
+        }, 'best_seaice_UNet.pth')
 
     tqdm.write(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
-## Test & Visualization
 
-checkpoint = torch.load('best_seaice_convlstm_3.pth', map_location=device)
+## Test & Visualization
+checkpoint = torch.load('best_seaice_UNet.pth', map_location=device)
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
@@ -301,16 +271,15 @@ with torch.no_grad():
 avg_test_loss = test_losses / len(test_loader.dataset)
 print(f"Average Test Loss = {avg_test_loss:.6f}")
 
-# Visualization
-def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/convlstm_3'):
+def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/STUNet_6'):
     os.makedirs(save_dir, exist_ok=True)
 
     N, L, _, _ = pred.shape
     X, Y = np.meshgrid(x_coords, y_coords)
 
     for i in tqdm(range(N), desc="Visualizing...", leave=False):
-        fig, axes = plt.subplots(1, 3, figsize=(24, 10))
-        
+        fig, axes = plt.subplots(1, L, figsize=(6 * L, 10))
+
         for h in range(L):
             diff_map = true[i, h] - pred[i, h]
             masked_diff_map = np.where(mask[i, h] == 1, diff_map, 0)
@@ -331,10 +300,10 @@ def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, s
 
         input_start = dates[start_idx + i - 12]
         input_end = dates[start_idx + i - 1]
-        fig.suptitle(f'Sample {i+1}: Input ({input_start} ~ {input_end}) → 3-Month Prediction', fontsize=16)
+        fig.suptitle(f'Sample {i+1}: Input ({input_start} ~ {input_end}) → 6-Month Prediction', fontsize=16)
 
         pred_start = dates[start_idx + i]
-        pred_end = dates[start_idx + i + 2]
+        pred_end = dates[start_idx + i + L - 1]
         fname = f'sic_error_map_{pred_start}_to_{pred_end}_sample_{i+1:03d}.png'
         plt.savefig(os.path.join(save_dir, fname), bbox_inches='tight')
         plt.close()
@@ -348,5 +317,5 @@ test_pred_vis = np.concatenate(test_preds, axis=0)
 test_true_vis = np.concatenate(test_trues, axis=0)
 test_mask_vis = torch.cat([m for _, _, m in test_loader], dim=0).numpy()
 
-# Visualize the prediction_step (0, first month) in Pred_L(3 months)
+# Visualize in Pred_L(6 months)
 plot_sic_error_map(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx)

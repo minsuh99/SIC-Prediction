@@ -79,9 +79,9 @@ class SeaIceDataset(Dataset):
 
         return seq_climate, target_sic, valid_mask
 
-train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=0, end_idx=239)
-val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=240, end_idx=299)
-test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=3, start_idx=300, end_idx=359)
+train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=0, end_idx=239)
+val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=240, end_idx=299)
+test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=6, start_idx=300, end_idx=359)
 
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
@@ -179,7 +179,7 @@ class ConvLSTM(nn.Module):
         return layer_output_list, last_state_list
 
 class SeaIceConvLSTM(nn.Module):
-    def __init__(self, input_channels=10, hidden_channels=64, kernel_size=(3, 3), lstm_layers=1, pred_L=3, bias=True):
+    def __init__(self, input_channels=10, hidden_channels=64, kernel_size=(3, 3), lstm_layers=1, pred_L=6, bias=True):
         super(SeaIceConvLSTM, self).__init__()
 
         self.pred_L = pred_L
@@ -219,7 +219,7 @@ class SeaIceConvLSTM(nn.Module):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_epochs = 30
-model = SeaIceConvLSTM(input_channels=10, hidden_channels=64, kernel_size=(3,3), lstm_layers=1, pred_L=3, bias=True).to(device)
+model = SeaIceConvLSTM(input_channels=10, hidden_channels=64, kernel_size=(3,3), lstm_layers=1, pred_L=6, bias=True).to(device)
 
 criterion = nn.MSELoss(reduction='none')
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
@@ -271,12 +271,12 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress", leave=True):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': avg_val_loss
-        }, 'best_seaice_convlstm_3.pth')
+        }, 'best_seaice_convlstm_6.pth')
 
     tqdm.write(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
 ## Test & Visualization
 
-checkpoint = torch.load('best_seaice_convlstm_3.pth', map_location=device)
+checkpoint = torch.load('best_seaice_convlstm_6.pth', map_location=device)
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
@@ -302,15 +302,15 @@ avg_test_loss = test_losses / len(test_loader.dataset)
 print(f"Average Test Loss = {avg_test_loss:.6f}")
 
 # Visualization
-def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/convlstm_3'):
+def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/GRU_6'):
     os.makedirs(save_dir, exist_ok=True)
 
     N, L, _, _ = pred.shape
     X, Y = np.meshgrid(x_coords, y_coords)
 
     for i in tqdm(range(N), desc="Visualizing...", leave=False):
-        fig, axes = plt.subplots(1, 3, figsize=(24, 10))
-        
+        fig, axes = plt.subplots(1, L, figsize=(6 * L, 10))
+
         for h in range(L):
             diff_map = true[i, h] - pred[i, h]
             masked_diff_map = np.where(mask[i, h] == 1, diff_map, 0)
@@ -331,10 +331,10 @@ def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, s
 
         input_start = dates[start_idx + i - 12]
         input_end = dates[start_idx + i - 1]
-        fig.suptitle(f'Sample {i+1}: Input ({input_start} ~ {input_end}) → 3-Month Prediction', fontsize=16)
+        fig.suptitle(f'Sample {i+1}: Input ({input_start} ~ {input_end}) → 6-Month Prediction', fontsize=16)
 
         pred_start = dates[start_idx + i]
-        pred_end = dates[start_idx + i + 2]
+        pred_end = dates[start_idx + i + L - 1]
         fname = f'sic_error_map_{pred_start}_to_{pred_end}_sample_{i+1:03d}.png'
         plt.savefig(os.path.join(save_dir, fname), bbox_inches='tight')
         plt.close()
@@ -348,5 +348,5 @@ test_pred_vis = np.concatenate(test_preds, axis=0)
 test_true_vis = np.concatenate(test_trues, axis=0)
 test_mask_vis = torch.cat([m for _, _, m in test_loader], dim=0).numpy()
 
-# Visualize the prediction_step (0, first month) in Pred_L(3 months)
+# Visualize in Pred_L(6 months)
 plot_sic_error_map(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx)
