@@ -117,7 +117,7 @@ class SeaIceTransformer(nn.Module):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_epochs = 30
-model = SeaIceTransformer(input_channels=10, hidden_size=64, pred_L=3).to(device)
+model = SeaIceTransformer(input_channels=10, pred_L=3).to(device)
 
 # Loss & Optimizer & Learning rate Scheduler
 criterion = nn.MSELoss(reduction='none')
