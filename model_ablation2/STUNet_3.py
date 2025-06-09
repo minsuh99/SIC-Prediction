@@ -92,24 +92,32 @@ test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=
 class TCNBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1):
         super().__init__()
-        pad_t = ((kernel_size - 1) // 2) * dilation
+        self.dilation = dilation
+        self.kernel_size = kernel_size
         self.conv = nn.Conv3d(
             in_channels, out_channels,
             kernel_size=(kernel_size, 1, 1),
-            padding=(pad_t, 0, 0),
+            padding=0,
             dilation=(dilation, 1, 1),
             bias=False
         )
         self.bn = nn.BatchNorm3d(out_channels)
         self.relu = nn.ReLU(inplace=True)
         self.dropout = nn.Dropout3d(0.2)
+        self.residual = nn.Conv3d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x):
+        pad_amt = self.dilation * (self.kernel_size - 1)
+        res = self.residual(x)
+
+        # pad only time dimension (dim=2)
+        x = F.pad(x, (0, 0, 0, 0, pad_amt, 0))  # pad only before
         x = self.conv(x)
         x = self.bn(x)
         x = self.relu(x)
         x = self.dropout(x)
-        return x
+
+        return x + res
 
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -236,18 +244,12 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress", leave=True):
     scheduler.step(avg_val_loss)
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': avg_val_loss
-        }, 'best_seaice_STUNet_3_Climate_SIC.pth')
+        torch.save(model.state_dict(), 'best_seaice_STUNet_3_Climate_SIC.pth')
 
     tqdm.write(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
 
 ## Test & Visualization
-checkpoint = torch.load('best_seaice_STUNet_3_Climate_SIC.pth', map_location=device)
-model.load_state_dict(checkpoint['model_state_dict'])
+model.load_state_dict(torch.load('best_seaice_STUNet_3_Climate_SIC.pth', map_location=device))
 model.eval()
 
 test_preds = []
