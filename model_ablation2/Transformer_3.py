@@ -122,7 +122,7 @@ model = SeaIceTransformer(input_channels=11, pred_L=3).to(device)
 
 # Loss & Optimizer & Learning rate Scheduler
 criterion = nn.MSELoss(reduction='none')
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
 
 best_val_loss = float('inf')
