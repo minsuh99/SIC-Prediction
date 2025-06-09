@@ -93,24 +93,32 @@ test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=
 class TCNBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1):
         super().__init__()
-        pad_t = ((kernel_size - 1) // 2) * dilation
+        self.dilation = dilation
+        self.kernel_size = kernel_size
         self.conv = nn.Conv3d(
             in_channels, out_channels,
             kernel_size=(kernel_size, 1, 1),
-            padding=(pad_t, 0, 0),
+            padding=0,
             dilation=(dilation, 1, 1),
             bias=False
         )
         self.bn = nn.BatchNorm3d(out_channels)
         self.relu = nn.ReLU(inplace=True)
         self.dropout = nn.Dropout3d(0.2)
+        self.residual = nn.Conv3d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x):
+        pad_amt = self.dilation * (self.kernel_size - 1)
+        res = self.residual(x)
+
+        # pad only time dimension (dim=2)
+        x = F.pad(x, (0, 0, 0, 0, pad_amt, 0))  # pad only before
         x = self.conv(x)
         x = self.bn(x)
         x = self.relu(x)
         x = self.dropout(x)
-        return x
+
+        return x + res
 
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
