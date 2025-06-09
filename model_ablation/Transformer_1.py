@@ -6,6 +6,7 @@ import re
 from netCDF4 import Dataset
 
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 from datetime import datetime
 from tqdm.auto import tqdm
@@ -159,23 +160,20 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress"):
     scheduler.step(avg_val_loss)
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': avg_val_loss
-        }, 'best_seaice_Transformer_1_SICOnly.pth')
+        torch.save(model.state_dict(), 'best_seaice_Transformer_1_SICOnly.pth')
 
     print(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
 
 ## Test & Visualization
-checkpoint = torch.load('best_seaice_Transformer_1_SICOnly.pth', map_location=device)
-model.load_state_dict(checkpoint['model_state_dict'])
+model.load_state_dict(torch.load('best_seaice_Transformer_1_SICOnly.pth', map_location=device))
 model.eval()
 
 test_preds = []
 test_trues = []
 test_losses = 0.0
+test_mae_total = 0.0
+test_mse_total = 0.0
+total_valid_pixels = 0
 
 with torch.no_grad():
     for seq_climate, target_sic, mask in test_loader:
@@ -188,11 +186,22 @@ with torch.no_grad():
         loss = (loss_map * mask).sum() / mask.sum()
         test_losses += loss.item() * seq_climate.size(0)
 
+        mae_map = F.l1_loss(pred_sic, target_sic, reduction='none')
+        test_mae_total += (mae_map * mask).sum().item()
+        test_mse_total += (loss_map * mask).sum().item()
+        total_valid_pixels += mask.sum().item()
+
         test_preds.append(pred_sic.cpu().numpy())
         test_trues.append(target_sic.cpu().numpy())
 
 avg_test_loss = test_losses / len(test_loader.dataset)
-print(f"Average Test Loss = {avg_test_loss:.6f}")
+avg_test_mae = test_mae_total / total_valid_pixels
+avg_test_mse = test_mse_total / total_valid_pixels
+avg_test_rmse = avg_test_mse ** 0.5
+
+print(f"Average Test MSE = {avg_test_mse:.6f}")
+print(f"Average Test RMSE = {avg_test_rmse:.6f}")
+print(f"Average Test MAE = {avg_test_mae:.6f}")
 
 def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, save_dir='./results/Transformer_1_SICOnly'):
     os.makedirs(save_dir, exist_ok=True)
@@ -203,18 +212,19 @@ def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, s
     for i in tqdm(range(N), desc="Visualizing...", leave=False):
         fig, ax = plt.subplots(1, 1, figsize=(8, 10))
         diff_map = true[i, 0] - pred[i, 0]
-        masked_diff_map = np.where(mask[i, 0] == 1, diff_map, 0)
+        masked_diff_map = np.where(mask[i, 0] == 1, diff_map, np.nan)
         date_str = dates[start_idx + i]
 
         cmap = plt.get_cmap('bwr').copy()
-        cmap.set_bad('gray')
+        cmap.set_bad(color='gray')
 
-        im = ax.pcolormesh(X, Y, masked_diff_map, cmap=cmap, vmin=-1, vmax=1, shading='auto')
+        bounds = np.linspace(-1, 1, 17)
+        norm = matplotlib.colors.BoundaryNorm(boundaries=bounds, ncolors=256)
+
+        im = ax.pcolormesh(X, Y, masked_diff_map, cmap=cmap, norm=norm)
         ax.set_title(f'{date_str}', fontsize=14)
         ax.set_xlabel('X (km)')
         ax.set_ylabel('Y (km)')
-
-        print(masked_diff_map.min(), masked_diff_map.max())
 
         fig.subplots_adjust(right=0.92)
         cbar_ax = fig.add_axes([0.94, 0.15, 0.02, 0.7])
@@ -229,7 +239,6 @@ def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, s
         plt.savefig(os.path.join(save_dir, fname), bbox_inches='tight')
         plt.close()
 
-
     
 # Print Visualization
 L = test_dataset.L
@@ -238,5 +247,5 @@ test_pred_vis = np.concatenate(test_preds, axis=0)
 test_true_vis = np.concatenate(test_trues, axis=0)
 test_mask_vis = torch.cat([m for _, _, m in test_loader], dim=0).numpy()
 
-# Visualize in Pred_L(1 month)
+# Visualize in Pred_L(1 months)
 plot_sic_error_map(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx)

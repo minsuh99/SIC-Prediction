@@ -6,6 +6,7 @@ import re
 from netCDF4 import Dataset
 
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 from datetime import datetime
 from tqdm.auto import tqdm
@@ -209,18 +210,19 @@ def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, s
     for i in tqdm(range(N), desc="Visualizing...", leave=False):
         fig, ax = plt.subplots(1, 1, figsize=(8, 10))
         diff_map = true[i, 0] - pred[i, 0]
-        masked_diff_map = np.where(mask[i, 0] == 1, diff_map, 0)
+        masked_diff_map = np.where(mask[i, 0] == 1, diff_map, np.nan)
         date_str = dates[start_idx + i]
 
         cmap = plt.get_cmap('bwr').copy()
-        cmap.set_bad('gray')
+        cmap.set_bad(color='gray')
 
-        im = ax.pcolormesh(X, Y, masked_diff_map, cmap=cmap, vmin=-1, vmax=1, shading='auto')
+        bounds = np.linspace(-1, 1, 17)
+        norm = matplotlib.colors.BoundaryNorm(boundaries=bounds, ncolors=256)
+
+        im = ax.pcolormesh(X, Y, masked_diff_map, cmap=cmap, norm=norm)
         ax.set_title(f'{date_str}', fontsize=14)
         ax.set_xlabel('X (km)')
         ax.set_ylabel('Y (km)')
-
-        print(masked_diff_map.min(), masked_diff_map.max())
 
         fig.subplots_adjust(right=0.92)
         cbar_ax = fig.add_axes([0.94, 0.15, 0.02, 0.7])
@@ -235,7 +237,6 @@ def plot_sic_error_map(pred, true, mask, x_coords, y_coords, dates, start_idx, s
         plt.savefig(os.path.join(save_dir, fname), bbox_inches='tight')
         plt.close()
 
-
     
 # Print Visualization
 L = test_dataset.L
@@ -244,5 +245,5 @@ test_pred_vis = np.concatenate(test_preds, axis=0)
 test_true_vis = np.concatenate(test_trues, axis=0)
 test_mask_vis = torch.cat([m for _, _, m in test_loader], dim=0).numpy()
 
-# Visualize in Pred_L(1 month)
+# Visualize in Pred_L(1 months)
 plot_sic_error_map(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx)
