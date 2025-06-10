@@ -8,11 +8,13 @@ class TCNBlock(nn.Module):
         super().__init__()
         self.dilation = dilation
         self.kernel_size = kernel_size
+        
+        # 시간 축(첫 번째 차원)에서만 convolution 수행
         self.conv = nn.Conv3d(
             in_channels, out_channels,
             kernel_size=(kernel_size, 1, 1),
-            padding=0,
-            dilation=(dilation, 1, 1),
+            padding=0, # causal convolution을 위한 padding
+            dilation=(dilation, 1, 1), # 시간축으로만 dilation
             bias=False
         )
         self.bn = nn.BatchNorm3d(out_channels)
@@ -31,7 +33,7 @@ class TCNBlock(nn.Module):
         x = self.relu(x)
         x = self.dropout(x)
 
-        return x + res
+        return x + res # residual connection
     
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -41,6 +43,7 @@ class DoubleConv(nn.Module):
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             nn.Dropout2d(0.2),
+            
             nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
@@ -53,15 +56,19 @@ class DoubleConv(nn.Module):
 class STUNet2D(nn.Module):
     def __init__(self, in_channels, out_channels, features=[64, 128, 256, 512]):
         super().__init__()
+        
+        # Encoder
         self.downs = nn.ModuleList()
         ch = in_channels
         for f in features:
             self.downs.append(DoubleConv(ch, f))
             ch = f
-        self.pool = nn.MaxPool2d(2,2)
+        self.pool = nn.MaxPool2d(2,2) # Pooling
 
+        # Bottleneck (가장 깊은 층)
         self.bottleneck = DoubleConv(features[-1], features[-1]*2)
 
+        # Decoder
         self.ups = nn.ModuleList()
         for f in reversed(features):
             self.ups.append(nn.ConvTranspose2d(f * 2, f, 2, 2))
@@ -83,12 +90,14 @@ class STUNet2D(nn.Module):
             skip = skips[i // 2]
             if x.shape != skip.shape:
                 x = F.interpolate(x, size=skip.shape[2:])
+                
+            # Skip connection -> Convolution
             x = self.ups[i + 1](torch.cat([skip, x], dim=1))
         x = self.final(x)
-        x = self.sigmoid(x)
+        x = self.sigmoid(x) # 0-1 사이 값으로 normalize
         return x
 
-class SeaIceSTSTUNet(nn.Module):
+class PNUNet(nn.Module):
     def __init__(self, input_channels=10, tcn_channels=64, tcn_layers=3, STunet_features=[64, 128, 256, 512], pred_L=1):
         super().__init__()
         self.pred_L = pred_L
@@ -99,6 +108,8 @@ class SeaIceSTSTUNet(nn.Module):
             layers.append(TCNBlock(ch, tcn_channels, kernel_size=3, dilation=2**i))
             ch = tcn_channels
         self.tcn = nn.Sequential(*layers)
+        
+        # 2D U-Net (공간적 패턴 학습)
         self.STunet = STUNet2D(tcn_channels, pred_L, STunet_features)
 
     def forward(self, x):

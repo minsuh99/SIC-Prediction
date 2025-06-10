@@ -36,6 +36,26 @@ hyper_params = {
 
 }
 
+# Unpacking
+window_size = hyper_params['window_size']
+prediction_length = hyper_params['prediction_length']
+
+train_start_idx = hyper_params['train_start_idx']
+train_end_idx = hyper_params['train_end_idx']
+val_start_idx = hyper_params['val_start_idx']
+val_end_idx = hyper_params['val_end_idx']
+test_start_idx = hyper_params['test_start_idx']
+test_end_idx = hyper_params['test_end_idx']
+
+batch_size = hyper_params['batch_size']
+num_workers = hyper_params['num_workers']
+learning_rate = hyper_params['learning_rate']
+epochs = hyper_params['epochs']
+
+tcn_channels = hyper_params['tcn_channels']
+tcn_layers = hyper_params['tcn_layers']
+UNet_features = hyper_params['UNet_features']
+
 # Fix Seed
 set_seed(42)
 
@@ -52,46 +72,45 @@ dates = sic_file['dates']  # List of dates corresponding to the SIC data
 mask = sic_file['mask']  # (360, 428, 300) (0: False(sea), 1: True(non-sea))
 
 # Additional preprocessing (Z-score normalization, with train_data)
-climate_train = climate_data[:240] 
+climate_train = climate_data[:train_end_idx+1] 
 # Feature-wise mean & std
 cm_mean = climate_train.mean(axis=(0, 2, 3), keepdims=True)
 cm_std = climate_train.std(axis=(0, 2, 3), keepdims=True)
 climate_data = (climate_data - cm_mean) / (cm_std + 1e-6)
 
 # Define Dataset
-train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=0, end_idx=239)
-val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=240, end_idx=299)
-test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=300, end_idx=359)
+train_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=window_size, prediction_length=prediction_length, start_idx=train_start_idx, end_idx=train_end_idx)
+val_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=window_size, prediction_length=prediction_length, start_idx=val_start_idx, end_idx=val_end_idx)
+test_dataset = SeaIceDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=window_size, prediction_length=prediction_length, start_idx=test_start_idx, end_idx=test_end_idx)
 
 # SIC ONLY Dataset 
-# train_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=0, end_idx=239)
-# val_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=240, end_idx=299)
-# test_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=300, end_idx=359)
+# train_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=window_size, prediction_length=prediction_length, start_idx=train_start_idx, end_idx=train_end_idx)
+# val_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=window_size, prediction_length=prediction_length, start_idx=val_start_idx, end_idx=val_end_idx)
+# test_dataset = SICOnlyDataset(sic_array=sic_data, mask_array=mask, window_length=window_size, prediction_length=prediction_length, start_idx=test_start_idx, end_idx=test_end_idx)
 
 # Climate and SIC Dataset
-# train_dataset = ClimateSICDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=0, end_idx=239)
-# val_dataset = ClimateSICDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=240, end_idx=299)
-# test_dataset = ClimateSICDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=12, prediction_length=1, start_idx=300, end_idx=359)
+# train_dataset = ClimateSICDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=window_size, prediction_length=prediction_length, start_idx=train_start_idx, end_idx=train_end_idx)
+# val_dataset = ClimateSICDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=window_size, prediction_length=prediction_length, start_idx=val_start_idx, end_idx=val_end_idx)
+# test_dataset = ClimateSICDataset(climate_array=climate_data, sic_array=sic_data, mask_array=mask, window_length=window_size, prediction_length=prediction_length, start_idx=test_start_idx, end_idx=test_end_idx)
 
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
-test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-num_epochs = 30
-model = PNUNet(input_channels=10, tcn_channels=64, tcn_layers=3, UNet_features=[64, 128, 256, 512], pred_L=1).to(device)
+model = PNUNet(input_channels=10, tcn_channels=tcn_channels, tcn_layers=tcn_layers, UNet_features=UNet_features, pred_L=prediction_length).to(device)
 # SIC ONLY
-# model = PNUNet(input_channels=1, tcn_channels=64, tcn_layers=3, UNet_features=[64, 128, 256, 512], pred_L=1).to(device)
+# model = PNUNet(input_channels=1, tcn_channels=tcn_channels, tcn_layers=tcn_layers, UNet_features=UNet_features, pred_L=prediction_length).to(device)
 # Climate + SIC
-# model = PNUNet(input_channels=11, tcn_channels=64, tcn_layers=3, UNet_features=[64, 128, 256, 512], pred_L=1).to(device)
+# model = PNUNet(input_channels=11, tcn_channels=tcn_channels, tcn_layers=tcn_layers, UNet_features=UNet_features, pred_L=prediction_length).to(device)
 
 loss_fn = nn.MSELoss(reduction='none')
-optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
 best_val_loss = float('inf')
 
 ## Train & Validation
-for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress", leave=True):
+for epoch in tqdm(range(1, epochs+1), desc="Training Progress", leave=True):
     # Train
     model.train()
     total_train_loss = 0.0
@@ -131,7 +150,7 @@ for epoch in tqdm(range(1, num_epochs+1), desc="Training Progress", leave=True):
         best_val_loss = avg_val_loss
         torch.save(model.state_dict(), 'PNUNet.pth')
 
-    tqdm.write(f"[Epoch {epoch}/{num_epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
+    tqdm.write(f"[Epoch {epoch}/{epochs}] Train Loss = {avg_train_loss:.6f}  |  Val Loss = {avg_val_loss:.6f}  |  LR = {optimizer.param_groups[0]['lr']:.2e}")
 
 ## Test & Visualization
 model.load_state_dict(torch.load('PNUNet.pth', map_location=device))
@@ -177,10 +196,12 @@ test_start_idx = test_dataset.start
 test_pred_vis = np.concatenate(test_preds, axis=0)
 test_true_vis = np.concatenate(test_trues, axis=0)
 test_mask_vis = torch.cat([mask for _, _, mask in test_loader], dim=0).numpy()
-save_dir='./results'
+save_dir='./results' # Change the path
 
 # Visualize with prediction length=1
 visualize_pred_L_1(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx, save_dir=save_dir)
-visualize_pred_L_1(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx, save_dir=save_dir)
-visualize_pred_L_1(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx, save_dir=save_dir)
+# # Visualize with prediction length=1
+# visualize_pred_L_3(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx, save_dir=save_dir)
+# # Visualize with prediction length=1
+# visualize_pred_L_6(pred=test_pred_vis, true=test_true_vis, mask=test_mask_vis, x_coords=x_coords, y_coords=y_coords, dates=dates, start_idx=test_start_idx, save_dir=save_dir)
 
