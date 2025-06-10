@@ -47,5 +47,7 @@ git clone [해당 Repository 주소]
 ```
 pip install -r requirements.txt
 ```
+4. 기존의 기후 변수 전처리 파일 download / 직접 원본 데이터 다운로드 후 Climate_variable_Preprocessing.ipynb 실행
+- 전처리 완료 파일 다운로드 링크: (https://www.dropbox.com/scl/fi/179413qvyenr4fxqr9yli/feature_real_final.npz?rlkey=b18ycpier7iifl5v8j24if7ge&st=4q31ru01&dl=0)
 
-4. main.py를 실행
+5. main.py를 실행
